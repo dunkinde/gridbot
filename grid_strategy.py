@@ -109,7 +109,10 @@ class GridSim:
     def __init__(self, cfg: GridConfig, cash: Optional[float] = None,
                  allow_same_candle_roundtrip: bool = False,
                  fill_through_pct: float = 0.0005,
-                 queue_factor: float = 2.0):
+                 queue_factor: float = 2.0,
+                 gamma: float = 0.0,
+                 trend_window: int = 0,
+                 trend_band: float = 0.0):
         self.cfg = cfg
         self.cash = cfg.budget if cash is None else cash
         self.holdings: List[float] = [0.0] * cfg.grids   # base qty held per cell
@@ -144,6 +147,39 @@ class GridSim:
         # which no limit order could ever do, and paper stops being comparable
         # to live.
         self.armed: List[bool] = [False] * cfg.grids
+
+        # --- inventory skew (Avellaneda-Stoikov reservation price) ---------
+        # A plain grid quotes around a FIXED ladder, so a falling market fills
+        # every buy on the way down and the position only grows. Real market
+        # makers quote around a reservation price shifted away from mid by
+        # their inventory: long inventory pushes quotes DOWN, so you stop
+        # buying so eagerly and exit sooner.
+        #
+        #   shift = -gamma * (base value / budget) * band width
+        #
+        # gamma = 0.0 reproduces the naive symmetric grid (current behaviour).
+        # gamma ~ 0.2 shifts the whole ladder down by a fifth of the band when
+        # fully long. The trade-off is explicit: less profit in chop, smaller
+        # drawdown in a trend. Which dominates is an empirical question -- run
+        # both and measure.
+        self.gamma = gamma
+        self._band = cfg.upper - cfg.lower
+
+        # --- trend filter --------------------------------------------------
+        # A grid is short trend: it grinds out small wins sideways and is run
+        # over in a sustained move, because it keeps buying all the way down.
+        # Skewing quotes does not fix that (measured: it costs far more in chop
+        # than it saves in a trend). Not being long does.
+        #
+        # So: track an EMA of price and stop ARMING BUYS while price is below
+        # it by more than `trend_band`. Existing inventory still sells, so the
+        # grid winds itself down to cash in a falling market and re-arms when
+        # price recovers. trend_window = 0 disables the filter entirely.
+        self.trend_window = trend_window
+        self.trend_band = trend_band
+        self._ema: Optional[float] = None
+        self._alpha = 2.0 / (trend_window + 1.0) if trend_window > 0 else 0.0
+        self.buys_blocked = 0
         self.trades_seen = 0
         self.volume_seen = 0.0
 
@@ -157,14 +193,18 @@ class GridSim:
         """
         cfg = self.cfg
         events = []
+        self.feed_trend(close)
+        may_buy = self.buying_allowed(close)
+        lv = self.levels_now(close)
         for i in range(cfg.grids):
-            bp, sp = cfg.levels[i], cfg.levels[i + 1]
+            bp, sp = lv[i], lv[i + 1]
             acted = False
             # price must trade through, not merely touch
             buy_trigger = bp * (1.0 - self.fill_through_pct)
             sell_trigger = sp * (1.0 + self.fill_through_pct)
 
-            if self.holdings[i] == 0.0 and low <= buy_trigger and self.cash >= cfg.per_cell:
+            if (may_buy and self.holdings[i] == 0.0 and low <= buy_trigger
+                    and self.cash >= cfg.per_cell):
                 # Binance charges the spot buy fee in the BASE asset received.
                 qty = cfg.per_cell * (1 - cfg.fee) / bp
                 self.cash -= cfg.per_cell
@@ -192,6 +232,40 @@ class GridSim:
                                "qty": float(qty), "cell": i})
         return events
 
+    def feed_trend(self, price: float) -> None:
+        """
+        Advance the trend EMA by ONE time step.
+
+        Call this once per bar, NOT once per trade. on_trade() fires thousands
+        of times a minute on BTC/USDT, so ticking the EMA there would make a
+        50-"sample" window span a few seconds and filter nothing. The candle
+        path (step) ticks it itself, since there a bar IS the time unit; the
+        trades path must be fed separately by the runner, once a minute.
+        """
+        if self.trend_window <= 0:
+            return
+        self._ema = price if self._ema is None else \
+            self._alpha * price + (1 - self._alpha) * self._ema
+
+    def buying_allowed(self, price: float) -> bool:
+        """False while price sits below its EMA by more than trend_band."""
+        if self.trend_window <= 0 or self._ema is None:
+            return True
+        return price >= self._ema * (1.0 - self.trend_band)
+
+    def skew(self, price: float) -> float:
+        """Price shift applied to every level, from current inventory. <= 0."""
+        if self.gamma <= 0.0:
+            return 0.0
+        inv_frac = (self.base_held() * price) / self.cfg.budget if self.cfg.budget else 0.0
+        inv_frac = max(0.0, min(inv_frac, 1.0))
+        return -self.gamma * inv_frac * self._band
+
+    def levels_now(self, price: float):
+        """The ladder as it currently stands, after inventory skew."""
+        sh = self.skew(price)
+        return [lv + sh for lv in self.cfg.levels]
+
     def on_trade(self, price: float, qty: float) -> list:
         """
         Process ONE executed market trade from the venue's public tape.
@@ -210,14 +284,19 @@ class GridSim:
         events = []
         self.trades_seen += 1
         self.volume_seen += qty
+        may_buy = self.buying_allowed(price)
+        lv = self.levels_now(price)
 
         for i in range(cfg.grids):
-            bp, sp = cfg.levels[i], cfg.levels[i + 1]
+            bp, sp = lv[i], lv[i + 1]
 
             if self.holdings[i] == 0.0:
                 # a buy is resting at bp; only trades at or below it count
                 if price > bp:
                     self.armed[i] = True      # market is above us: order can rest
+                    continue
+                if not may_buy:
+                    self.buys_blocked += 1
                     continue
                 if not self.armed[i] or self.cash < cfg.per_cell:
                     continue
@@ -273,6 +352,10 @@ class GridSim:
             "trades_seen": self.trades_seen,
             "volume_seen": self.volume_seen,
             "queue_factor": self.queue_factor,
+            "gamma": self.gamma,
+            "trend_window": self.trend_window,
+            "trend_band": self.trend_band,
+            "ema": self._ema,
             "fill_through_pct": self.fill_through_pct,
         }
 
@@ -294,6 +377,8 @@ class GridSim:
         self.realized_pnl = float(d.get("realized_pnl", 0.0))
         self.trades_seen = int(d.get("trades_seen", 0))
         self.volume_seen = float(d.get("volume_seen", 0.0))
+        if d.get("ema") is not None:
+            self._ema = float(d["ema"])
 
     # ---- reporting -------------------------------------------------------
     def base_held(self) -> float:
