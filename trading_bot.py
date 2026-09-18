@@ -148,9 +148,17 @@ class Notifier(threading.Thread):
 # --------------------------------------------------------------------------
 def make_exchange(cfg: Config) -> "ccxt.Exchange":
     klass = getattr(ccxt, cfg.exchange)
+    # Paper mode reads PRODUCTION market data and never places an order, so it
+    # gets no credentials at all. Two reasons: passing keys makes ccxt issue
+    # signed requests (fetch_markets hits /sapi/v1/margin/allPairs, where
+    # testnet keys are rejected with a 400), and a client with no keys is
+    # structurally incapable of trading -- paper mode cannot touch real money
+    # even if something else is misconfigured.
+    creds = ("", "") if cfg.paper else (os.getenv("EXCHANGE_API_KEY", ""),
+                                        os.getenv("EXCHANGE_API_SECRET", ""))
     ex = klass({
-        "apiKey": os.getenv("EXCHANGE_API_KEY", ""),
-        "secret": os.getenv("EXCHANGE_API_SECRET", ""),
+        "apiKey": creds[0],
+        "secret": creds[1],
         "enableRateLimit": True,
         "options": {
             # Binance rejects signed requests whose timestamp drifts outside
@@ -165,6 +173,9 @@ def make_exchange(cfg: Config) -> "ccxt.Exchange":
             # there with -2008 "Invalid Api-Key ID" and the bot dies at startup.
             # Nothing here needs the currency list.
             "fetchCurrencies": False,
+            # only spot markets; stops ccxt fetching margin/futures market
+            # lists over /sapi, which we neither need nor are authorised for
+            "fetchMarkets": ["spot"],
         },
     })
     if cfg.testnet:
