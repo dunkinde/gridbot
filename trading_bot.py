@@ -153,6 +153,12 @@ def make_exchange(cfg: Config) -> "ccxt.Exchange":
             "adjustForTimeDifference": True,
             "recvWindow": 5000,
             "defaultType": "spot",
+            # load_markets() calls fetch_currencies(), which ccxt routes to
+            # PRODUCTION's /sapi/v1/capital/config/getall even in sandbox mode.
+            # The testnet has no /sapi at all, so testnet keys get rejected
+            # there with -2008 "Invalid Api-Key ID" and the bot dies at startup.
+            # Nothing here needs the currency list.
+            "fetchCurrencies": False,
         },
     })
     if cfg.testnet:
