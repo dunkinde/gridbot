@@ -73,6 +73,14 @@ class Config:
                                        # tape) or "candles" (crude, OHLCV)
     queue_factor: float = 2.0          # trades model: multiples of our own size
                                        # that must trade at/through a level
+    trend_window: int = 0              # EMA length in 1-minute bars; 0 = off.
+                                       # While price sits below the EMA the grid
+                                       # stops buying and winds down to cash.
+    trend_band: float = 0.0            # tolerance below the EMA before buying
+                                       # stops (0.005 = 0.5%)
+    gamma: float = 0.0                 # inventory skew. MEASURED BADLY: costs
+                                       # ~6x more in chop than it saves in a
+                                       # trend. Left available, default off.
 
     @property
     def paper(self) -> bool:
@@ -781,7 +789,8 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
         gcfg.lower, gcfg.upper = gdict["lower"], gdict["upper"]
         gcfg.levels = list(gdict["levels"])
         sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
-                      queue_factor=cfg.queue_factor)
+                      queue_factor=cfg.queue_factor, gamma=cfg.gamma,
+                      trend_window=cfg.trend_window, trend_band=cfg.trend_band)
         sim.load_dict(sdict or {})
         age = (time.time() - (resumed[3] or time.time())) / 3600
         log.info("resumed paper state: %d round trips, %.1f h of run so far",
@@ -789,11 +798,17 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
     else:
         gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
         sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
-                      queue_factor=cfg.queue_factor)
+                      queue_factor=cfg.queue_factor, gamma=cfg.gamma,
+                      trend_window=cfg.trend_window, trend_band=cfg.trend_band)
 
     model = (f"trade tape, need {cfg.queue_factor:g}x own size through a level"
              if cfg.fill_model == "trades"
              else f"candles, through by {cfg.fill_through_pct:.3%}")
+    if cfg.trend_window > 0:
+        model += (f" | trend filter: no buys below the {cfg.trend_window}-bar EMA"
+                  + (f" -{cfg.trend_band:.2%}" if cfg.trend_band else ""))
+    if cfg.gamma > 0:
+        model += f" | inventory skew gamma={cfg.gamma:g}"
     notifier.send(f"PAPER grid on {cfg.symbol} @ {price:,.2f}\n{gcfg.describe()}\n"
                   f"fill model: {model}")
     log.info("\n%s\nfill model: %s", gcfg.describe(), model)
@@ -804,6 +819,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
     last_summary = time.time()
     last_saved = 0.0
     last_saved_fills = -1
+    last_trend = 0.0
 
     while not stop.is_set():
         try:
@@ -837,6 +853,15 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                                  "up by paging, no volume lost", saturated)
                 if px is None:
                     px = float(ex.fetch_ticker(cfg.symbol)["last"])
+                # one EMA step per minute, from 1m closes -- never per trade
+                if cfg.trend_window > 0 and time.time() - last_trend >= 60:
+                    try:
+                        bars = ex.fetch_ohlcv(cfg.symbol, "1m", limit=2)
+                        if bars:
+                            sim.feed_trend(float(bars[-1][4]))
+                    except ccxt.NetworkError:
+                        pass
+                    last_trend = time.time()
                 if sim.buys + sim.sells != last_saved_fills or \
                         time.time() - last_saved > 60:
                     _paper_save(cfg, gcfg, sim, last_id, started_at)
@@ -860,7 +885,9 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                 eq = sim.equity(px)
                 gcfg = make_grid_around(px, eq, cfg.range_pct, cfg.grids, cfg.fee)
                 sim = GridSim(gcfg, cash=eq, fill_through_pct=cfg.fill_through_pct,
-                              queue_factor=cfg.queue_factor)
+                              queue_factor=cfg.queue_factor, gamma=cfg.gamma,
+                              trend_window=cfg.trend_window,
+                              trend_band=cfg.trend_band)
                 last_id = None
                 _paper_save(cfg, gcfg, sim, last_id, started_at)
                 log.info("re-centred around %.2f", px)
@@ -901,6 +928,22 @@ def run_live(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> None
         raise SystemExit("insufficient quote balance")
 
     log.info("\n%s", gcfg.describe())
+
+    # A halt-on-escape exits cleanly, but systemd restarts the unit and resume
+    # adopts the SAVED band -- if price is still outside it, the bot escapes
+    # again immediately and loops for ever. Refuse to start instead, before
+    # placing or cancelling anything, and say what to do about it.
+    tol = cfg.escape_tolerance
+    if resumed and (price < gcfg.lower * (1 - tol) or price > gcfg.upper * (1 + tol)):
+        msg = (f"price {price:,.2f} is outside the saved grid "
+               f"[{gcfg.lower:,.2f}, {gcfg.upper:,.2f}] — not restarting.\n"
+               f"Delete {cfg.state_file} to build a fresh band around the "
+               f"current price.")
+        notifier.send("🛑 " + msg)
+        log.warning(msg)
+        notifier.drain()
+        return
+
     grid.reconcile()
     if not resumed:
         notifier.send(f"LIVE grid on {cfg.symbol} @ {price:,.2f}\n{gcfg.describe()}")
@@ -963,6 +1006,15 @@ def parse_args() -> Config:
                    help="trades model: multiples of our own order size that must "
                         "trade at/through a level before we count a fill. "
                         "1.0 = front of queue, 2.0 = one equal order ahead")
+    p.add_argument("--trend-window", type=int, default=d.trend_window,
+                   help="EMA length in 1-minute bars. While price is below the "
+                        "EMA the grid stops buying and winds down to cash. "
+                        "0 disables. 50 measured best on synthetic regimes")
+    p.add_argument("--trend-band", type=float, default=d.trend_band,
+                   help="tolerance below the EMA before buying halts (0.005=0.5%%)")
+    p.add_argument("--gamma", type=float, default=d.gamma,
+                   help="inventory skew. Measured badly -- costs ~6x more in "
+                        "chop than it saves in a trend. Default off")
     p.add_argument("--fill-through-pct", type=float, default=d.fill_through_pct,
                    help="paper mode only: how far price must trade THROUGH a "
                         "level before a fill counts. 0 = optimistic (touch); "
@@ -994,7 +1046,9 @@ def parse_args() -> Config:
                  max_drawdown_pct=a.max_drawdown_pct, state_file=a.state_file,
                  seed_inventory=a.seed_inventory, post_only=not a.no_post_only,
                  fill_through_pct=a.fill_through_pct,
-                 fill_model=a.fill_model, queue_factor=a.queue_factor)
+                 fill_model=a.fill_model, queue_factor=a.queue_factor,
+                 trend_window=a.trend_window, trend_band=a.trend_band,
+                 gamma=a.gamma)
     cfg._cancel_all = a.cancel_all      # type: ignore[attr-defined]
     return cfg
 
