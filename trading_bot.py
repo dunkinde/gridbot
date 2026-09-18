@@ -37,7 +37,7 @@ try:
 except ImportError:
     raise SystemExit("pip install ccxt")
 
-from grid_strategy import GridSim, make_grid_around
+from grid_strategy import GridConfig, GridSim, make_grid_around
 
 log = logging.getLogger("gridbot")
 
@@ -670,7 +670,117 @@ class LiveGrid:
 # --------------------------------------------------------------------------
 # Runners
 # --------------------------------------------------------------------------
-PAPER_STATE_VERSION = 1
+PAPER_STATE_VERSION = 2
+
+
+class PaperSim(GridSim):
+    """Paper-only lifetime accounting; grid capital may change independently."""
+
+    def __init__(self, cfg, *args, initial_budget=None, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        self.initial_budget = cfg.budget if initial_budget is None else initial_budget
+        self.recentres = 0
+        self.liquidations = 0
+        self.liquidation_pnl = 0.0
+        self.history_complete = True
+        self.seen_ts = 0
+
+    def stats(self, price):
+        st = super().stats(price)
+        st["total_pnl"] = st["equity"] - self.initial_budget
+        st["return_pct"] = st["total_pnl"] / self.initial_budget
+        return st
+
+    def to_dict(self):
+        d = super().to_dict()
+        d["paper_accounting"] = {
+            "initial_budget": self.initial_budget,
+            "recentres": self.recentres,
+            "liquidations": self.liquidations,
+            "liquidation_pnl": self.liquidation_pnl,
+            "history_complete": self.history_complete,
+            "seen_ts": self.seen_ts,
+            "buys_blocked": self.buys_blocked,
+        }
+        return d
+
+    def load_dict(self, d):
+        super().load_dict(d)
+        accounting = d.get("paper_accounting")
+        if accounting is None:
+            # Version 1 lost counters at every re-centre. Never invent them.
+            self.history_complete = False
+            log.warning("legacy paper state: historical counters/fees may be incomplete; "
+                        "lifetime PnL assumes --budget %.2f was the original capital",
+                        self.initial_budget)
+            return
+        initial = float(accounting["initial_budget"])
+        if not math.isfinite(initial) or initial <= 0:
+            raise ValueError("Invalid initial budget in paper state")
+        self.initial_budget = initial
+        self.recentres = int(accounting["recentres"])
+        self.liquidations = int(accounting["liquidations"])
+        self.liquidation_pnl = float(accounting["liquidation_pnl"])
+        self.history_complete = bool(accounting["history_complete"])
+        self.seen_ts = int(accounting.get("seen_ts", 0))
+        self.buys_blocked = int(accounting.get("buys_blocked", 0))
+
+
+def _paper_recentre(cfg, sim, price):
+    """Close inventory at the observed price, charge cfg.fee, retain history.
+
+    This is a simulated liquidation with no slippage model. It is tracked
+    separately from completed grid round trips.
+    """
+    held = sim.base_held()
+    proceeds = held * price
+    fee = proceeds * cfg.fee
+    cash = sim.cash + proceeds - fee
+    if not math.isfinite(cash) or cash <= 0:
+        raise ValueError("Cannot re-centre a paper grid with non-positive equity")
+    gcfg = make_grid_around(price, cash, cfg.range_pct, cfg.grids, cfg.fee)
+    new = PaperSim(gcfg, cash=cash, initial_budget=sim.initial_budget,
+                   fill_through_pct=cfg.fill_through_pct,
+                   queue_factor=cfg.queue_factor, gamma=cfg.gamma,
+                   trend_window=cfg.trend_window, trend_band=cfg.trend_band)
+    for key in ("buys", "sells", "completed", "fees_paid", "realized_pnl",
+                "trades_seen", "volume_seen", "buys_blocked", "_ema",
+                "recentres", "liquidations", "liquidation_pnl",
+                "history_complete", "seen_ts"):
+        setattr(new, key, getattr(sim, key))
+    new.recentres += 1
+    if held > 0:
+        pnl = proceeds - fee - sum(sim.cost_basis)
+        new.fees_paid += fee
+        new.realized_pnl += pnl
+        new.liquidation_pnl += pnl
+        new.liquidations += 1
+        log.info("PAPER re-centre liquidation: %.8f base @ %.2f; fee %.4f; "
+                 "realised PnL %.4f (observed price, no slippage)",
+                 held, price, fee, pnl)
+    return gcfg, new
+
+
+def _paper_grid_from_state(cfg, saved):
+    """Restore actual invested capital and levels, including compound gains."""
+    if int(saved["grids"]) != cfg.grids:
+        raise ValueError("Paper grid count changed; use a separate state file")
+    if "fee" in saved and float(saved["fee"]) != cfg.fee:
+        raise ValueError("Paper fee changed; use a separate state file")
+    grid = GridConfig(budget=float(saved["budget"]),
+                      lower=float(saved["lower"]), upper=float(saved["upper"]),
+                      grids=cfg.grids, fee=cfg.fee,
+                      spacing=saved.get("spacing", "geometric"))
+    levels = [float(x) for x in saved["levels"]]
+    if (len(levels) != cfg.grids + 1
+            or any(not math.isfinite(x) or x <= 0 for x in levels)
+            or any(a >= b for a, b in zip(levels, levels[1:]))
+            or not math.isclose(levels[0], grid.lower)
+            or not math.isclose(levels[-1], grid.upper)):
+        raise ValueError("Invalid levels in paper state")
+    grid.levels = levels
+    grid.worst_step_pct = min(b / a - 1 for a, b in zip(levels, levels[1:]))
+    return grid
 
 
 def _paper_save(cfg: Config, gcfg, sim, last_id, started_at) -> None:
@@ -680,7 +790,8 @@ def _paper_save(cfg: Config, gcfg, sim, last_id, started_at) -> None:
         "symbol": cfg.symbol,
         "grid": {"lower": gcfg.lower, "upper": gcfg.upper,
                  "grids": gcfg.grids, "budget": gcfg.budget,
-                 "levels": list(gcfg.levels)},
+                 "levels": list(gcfg.levels), "fee": gcfg.fee,
+                 "spacing": gcfg.spacing},
         "sim": sim.to_dict(),
         "last_id": str(last_id) if last_id is not None else None,
         "started_at": started_at,
@@ -705,11 +816,12 @@ def _paper_load(cfg: Config):
         with open(cfg.state_file) as fh:
             st = json.load(fh)
     except Exception as e:
-        log.warning("paper state unreadable (%s) — starting fresh", e)
-        return None
-    if st.get("version") != PAPER_STATE_VERSION or st.get("symbol") != cfg.symbol:
-        log.warning("paper state is for a different version/symbol — starting fresh")
-        return None
+        raise ValueError("Paper state unreadable; refusing to overwrite its history") from e
+    if st.get("version") not in (1, PAPER_STATE_VERSION) or st.get("symbol") != cfg.symbol:
+        raise ValueError("Paper state has a different version/symbol; use a separate state file")
+    if st.get("version") == PAPER_STATE_VERSION and not isinstance(
+            (st.get("sim") or {}).get("paper_accounting"), dict):
+        raise ValueError("Paper state is missing lifetime accounting")
     return (st.get("grid"), st.get("sim"), st.get("last_id"),
             st.get("started_at", time.time()))
 
@@ -755,9 +867,14 @@ def _paper_report(sim, px, label="PAPER") -> str:
             f"fees paid    {st['fees_paid']:,.2f}"
             + (f"  ({fee_ratio:.0%} of realised)" if fee_ratio != float('inf') else "") + "\n"
             f"inventory    {st['base_held']:.8f} ({st['base_value']:,.2f})\n"
+            f"initial      {sim.initial_budget:,.2f}\n"
+            f"equity       {st['equity']:,.2f}\n"
             f"total PnL    {st['total_pnl']:,.2f}  ({st['return_pct']:+.3%})\n"
+            f"re-centres   {sim.recentres}; liquidations {sim.liquidations}\n"
             f"tape seen    {st['trades_observed']:,} trades, "
-            f"{st['volume_observed']:,.4f} base")
+            f"{st['volume_observed']:,.4f} base"
+            + ("\nhistory      incomplete before upgrade; initial capital assumed from --budget"
+               if not sim.history_complete else ""))
 
 
 def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> None:
@@ -782,13 +899,12 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
 
     if resumed:
         gdict, sdict, last_id, started_at = resumed
-        gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
         # adopt the SAVED band, not a fresh one around today's price, or the
         # measurement silently re-centres on every restart and the week's
         # numbers become meaningless
-        gcfg.lower, gcfg.upper = gdict["lower"], gdict["upper"]
-        gcfg.levels = list(gdict["levels"])
-        sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
+        gcfg = _paper_grid_from_state(cfg, gdict)
+        sim = PaperSim(gcfg, initial_budget=cfg.budget,
+                      fill_through_pct=cfg.fill_through_pct,
                       queue_factor=cfg.queue_factor, gamma=cfg.gamma,
                       trend_window=cfg.trend_window, trend_band=cfg.trend_band)
         sim.load_dict(sdict or {})
@@ -797,7 +913,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                  sim.completed, age)
     else:
         gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
-        sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
+        sim = PaperSim(gcfg, fill_through_pct=cfg.fill_through_pct,
                       queue_factor=cfg.queue_factor, gamma=cfg.gamma,
                       trend_window=cfg.trend_window, trend_band=cfg.trend_band)
 
@@ -812,8 +928,9 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
     notifier.send(f"PAPER grid on {cfg.symbol} @ {price:,.2f}\n{gcfg.describe()}\n"
                   f"fill model: {model}")
     log.info("\n%s\nfill model: %s", gcfg.describe(), model)
+    log.info("\n%s", _paper_report(sim, price, "PAPER cumulative"))
 
-    seen_ts = 0
+    seen_ts = sim.seen_ts
     backoff = cfg.poll_seconds
     saturated = 0
     last_summary = time.time()
@@ -845,6 +962,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                                               f"cell {ev['cell']} @ {ev['price']:,.2f}")
                     last_id = batch[-1].get("id") or last_id
                     seen_ts = batch[-1].get("timestamp") or seen_ts
+                    sim.seen_ts = seen_ts
                     px = float(batch[-1]["price"])
                 if behind:
                     saturated += 1
@@ -873,6 +991,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                     if c[0] <= seen_ts:
                         continue
                     seen_ts = c[0]
+                    sim.seen_ts = seen_ts
                     for ev in sim.step(c[2], c[3], c[4]):
                         log.info("PAPER %s cell=%d @ %.2f | equity=%.2f",
                                  ev["side"], ev["cell"], ev["price"], sim.equity(c[4]))
@@ -882,15 +1001,11 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                                          or px > gcfg.upper * (1 + cfg.escape_tolerance)):
                 notifier.send(f"PAPER price {px:,.2f} escaped the grid — re-centring.\n"
                               + _paper_report(sim, px))
-                eq = sim.equity(px)
-                gcfg = make_grid_around(px, eq, cfg.range_pct, cfg.grids, cfg.fee)
-                sim = GridSim(gcfg, cash=eq, fill_through_pct=cfg.fill_through_pct,
-                              queue_factor=cfg.queue_factor, gamma=cfg.gamma,
-                              trend_window=cfg.trend_window,
-                              trend_band=cfg.trend_band)
-                last_id = None
+                gcfg, sim = _paper_recentre(cfg, sim, px)
+                # Keep the tape cursor: a new band must not replay old trades.
                 _paper_save(cfg, gcfg, sim, last_id, started_at)
                 log.info("re-centred around %.2f", px)
+                log.info("\n%s", _paper_report(sim, px, "PAPER cumulative"))
 
             if time.time() - last_summary > 6 * 3600:
                 notifier.send(_paper_report(sim, px, "PAPER 6h update"))
