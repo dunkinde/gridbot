@@ -136,6 +136,14 @@ class GridSim:
         # are at the very front; 2.0 assumes an equal-sized order ahead of us.
         self.queue_factor = queue_factor
         self.pending_vol: List[float] = [0.0] * cfg.grids
+        # A resting BUY can only exist below the market. A cell whose level is
+        # above the current price has no order there -- in live trading
+        # bootstrap() only arms cells with levels[i] < price. So a cell becomes
+        # "armed" only once price has traded ABOVE its buy level; until then it
+        # cannot fill. Without this the simulator buys at prices above market,
+        # which no limit order could ever do, and paper stops being comparable
+        # to live.
+        self.armed: List[bool] = [False] * cfg.grids
         self.trades_seen = 0
         self.volume_seen = 0.0
 
@@ -208,7 +216,10 @@ class GridSim:
 
             if self.holdings[i] == 0.0:
                 # a buy is resting at bp; only trades at or below it count
-                if price > bp or self.cash < cfg.per_cell:
+                if price > bp:
+                    self.armed[i] = True      # market is above us: order can rest
+                    continue
+                if not self.armed[i] or self.cash < cfg.per_cell:
                     continue
                 want = cfg.per_cell / bp
                 self.pending_vol[i] += qty
