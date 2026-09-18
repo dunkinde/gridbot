@@ -107,7 +107,9 @@ class GridSim:
     """State machine. Feed it OHLC candles one at a time; it returns fill events."""
 
     def __init__(self, cfg: GridConfig, cash: Optional[float] = None,
-                 allow_same_candle_roundtrip: bool = False):
+                 allow_same_candle_roundtrip: bool = False,
+                 fill_through_pct: float = 0.0005,
+                 queue_factor: float = 2.0):
         self.cfg = cfg
         self.cash = cfg.budget if cash is None else cash
         self.holdings: List[float] = [0.0] * cfg.grids   # base qty held per cell
@@ -118,6 +120,24 @@ class GridSim:
         self.fees_paid = 0.0
         self.realized_pnl = 0.0
         self.allow_same_candle_roundtrip = allow_same_candle_roundtrip
+        # A resting limit order does NOT fill just because price touched its
+        # level -- you are in a queue behind everyone else who wanted that
+        # price, and a brief touch that reverses leaves you unfilled. Requiring
+        # price to trade THROUGH the level by this fraction is a crude proxy for
+        # queue position. 0.0 reproduces the old, flattering behaviour.
+        self.fill_through_pct = fill_through_pct
+
+        # --- volume-based queue model (used by on_trade) -------------------
+        # A resting limit order is not filled by price touching its level. It
+        # fills when enough volume actually TRADES at or through that level to
+        # clear the queue ahead of it. We cannot see the real queue, so we
+        # require `queue_factor` times our own order size to trade at or
+        # through the level before counting a fill. queue_factor=1.0 assumes we
+        # are at the very front; 2.0 assumes an equal-sized order ahead of us.
+        self.queue_factor = queue_factor
+        self.pending_vol: List[float] = [0.0] * cfg.grids
+        self.trades_seen = 0
+        self.volume_seen = 0.0
 
     def step(self, high: float, low: float, close: float) -> list:
         """
@@ -132,8 +152,11 @@ class GridSim:
         for i in range(cfg.grids):
             bp, sp = cfg.levels[i], cfg.levels[i + 1]
             acted = False
+            # price must trade through, not merely touch
+            buy_trigger = bp * (1.0 - self.fill_through_pct)
+            sell_trigger = sp * (1.0 + self.fill_through_pct)
 
-            if self.holdings[i] == 0.0 and low <= bp and self.cash >= cfg.per_cell:
+            if self.holdings[i] == 0.0 and low <= buy_trigger and self.cash >= cfg.per_cell:
                 # Binance charges the spot buy fee in the BASE asset received.
                 qty = cfg.per_cell * (1 - cfg.fee) / bp
                 self.cash -= cfg.per_cell
@@ -145,7 +168,7 @@ class GridSim:
                 events.append({"side": "buy", "price": float(bp),
                                "qty": float(qty), "cell": i})
 
-            if (self.holdings[i] > 0.0 and high >= sp
+            if (self.holdings[i] > 0.0 and high >= sell_trigger
                     and (not acted or self.allow_same_candle_roundtrip)):
                 qty = self.holdings[i]
                 proceeds = qty * sp
@@ -159,6 +182,67 @@ class GridSim:
                 self.completed += 1
                 events.append({"side": "sell", "price": float(sp),
                                "qty": float(qty), "cell": i})
+        return events
+
+    def on_trade(self, price: float, qty: float) -> list:
+        """
+        Process ONE executed market trade from the venue's public tape.
+
+        This is the realistic fill path: instead of assuming a fill because a
+        candle's low reached our level, we accumulate the volume that actually
+        traded at or through each resting order and fill only once enough has
+        gone through to plausibly clear the queue ahead of us.
+
+        Assumption worth knowing: the accumulator is NOT reset when price moves
+        away from a level and later returns. A real queue does partially reset
+        as orders are cancelled and added, so this is mildly optimistic --
+        `queue_factor` is the dial that offsets it.
+        """
+        cfg = self.cfg
+        events = []
+        self.trades_seen += 1
+        self.volume_seen += qty
+
+        for i in range(cfg.grids):
+            bp, sp = cfg.levels[i], cfg.levels[i + 1]
+
+            if self.holdings[i] == 0.0:
+                # a buy is resting at bp; only trades at or below it count
+                if price > bp or self.cash < cfg.per_cell:
+                    continue
+                want = cfg.per_cell / bp
+                self.pending_vol[i] += qty
+                if self.pending_vol[i] < self.queue_factor * want:
+                    continue
+                got = cfg.per_cell * (1 - cfg.fee) / bp
+                self.cash -= cfg.per_cell
+                self.holdings[i] = got
+                self.cost_basis[i] = cfg.per_cell
+                self.fees_paid += cfg.per_cell * cfg.fee
+                self.buys += 1
+                self.pending_vol[i] = 0.0
+                events.append({"side": "buy", "price": float(bp),
+                               "qty": float(got), "cell": i})
+            else:
+                # a sell is resting at sp; only trades at or above it count
+                if price < sp:
+                    continue
+                held = self.holdings[i]
+                self.pending_vol[i] += qty
+                if self.pending_vol[i] < self.queue_factor * held:
+                    continue
+                proceeds = held * sp
+                fee = proceeds * cfg.fee
+                self.cash += proceeds - fee
+                self.fees_paid += fee
+                self.realized_pnl += proceeds - fee - self.cost_basis[i]
+                self.holdings[i] = 0.0
+                self.cost_basis[i] = 0.0
+                self.sells += 1
+                self.completed += 1
+                self.pending_vol[i] = 0.0
+                events.append({"side": "sell", "price": float(sp),
+                               "qty": float(held), "cell": i})
         return events
 
     # ---- reporting -------------------------------------------------------
@@ -182,6 +266,8 @@ class GridSim:
             "fees_paid": self.fees_paid,
             "total_pnl": eq - self.cfg.budget,
             "return_pct": (eq - self.cfg.budget) / self.cfg.budget,
+            "trades_observed": self.trades_seen,
+            "volume_observed": self.volume_seen,
         }
 
 

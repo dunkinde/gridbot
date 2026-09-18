@@ -67,6 +67,12 @@ class Config:
     post_only: bool = True
     state_file: str = "gridbot_state.json"
     escape_tolerance: float = 0.005
+    fill_through_pct: float = 0.0005   # candle fill model: price must trade
+                                       # THROUGH a level, not merely touch it
+    fill_model: str = "trades"         # "trades" (realistic, uses the public
+                                       # tape) or "candles" (crude, OHLCV)
+    queue_factor: float = 2.0          # trades model: multiples of our own size
+                                       # that must trade at/through a level
 
     @property
     def paper(self) -> bool:
@@ -645,46 +651,133 @@ class LiveGrid:
 # --------------------------------------------------------------------------
 # Runners
 # --------------------------------------------------------------------------
+def _paper_report(sim, px, label="PAPER") -> str:
+    st = sim.stats(px)
+    fee_ratio = (st["fees_paid"] / st["realized_pnl"]) if st["realized_pnl"] > 0 else float("inf")
+    return (f"{label} @ {px:,.2f}\n"
+            f"round trips  {st['completed_roundtrips']}\n"
+            f"realised     {st['realized_pnl']:,.2f}\n"
+            f"fees paid    {st['fees_paid']:,.2f}"
+            + (f"  ({fee_ratio:.0%} of realised)" if fee_ratio != float('inf') else "") + "\n"
+            f"inventory    {st['base_held']:.8f} ({st['base_value']:,.2f})\n"
+            f"total PnL    {st['total_pnl']:,.2f}  ({st['return_pct']:+.3%})\n"
+            f"tape seen    {st['trades_observed']:,} trades, "
+            f"{st['volume_observed']:,.4f} base")
+
+
 def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> None:
-    tf = cfg.timeframe
-    ohlcv = ex.fetch_ohlcv(cfg.symbol, tf, limit=3)
-    price = ohlcv[-1][4]
+    """
+    Simulated money, REAL production market data.
+
+    Two fill models:
+
+      trades  (default) -- consumes the venue's public trade tape and fills a
+              resting order only once `queue_factor` times its own size has
+              actually traded at or through its level. This is the honest one:
+              it answers "did enough volume change hands at my price", which is
+              what determines a real fill.
+
+      candles -- the old OHLCV model. Fills when a candle trades through the
+              level by `fill_through_pct`. Crude, and flattering.
+    """
+    price = float(ex.fetch_ticker(cfg.symbol)["last"])
     gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
-    sim = GridSim(gcfg)
-    notifier.send(f"PAPER grid on {cfg.symbol} @ {price:,.2f}\n{gcfg.describe()}")
-    log.info("\n%s", gcfg.describe())
-    seen_ts = ohlcv[-1][0]
+    sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
+                  queue_factor=cfg.queue_factor)
+
+    model = (f"trade tape, need {cfg.queue_factor:g}x own size through a level"
+             if cfg.fill_model == "trades"
+             else f"candles, through by {cfg.fill_through_pct:.3%}")
+    notifier.send(f"PAPER grid on {cfg.symbol} @ {price:,.2f}\n{gcfg.describe()}\n"
+                  f"fill model: {model}")
+    log.info("\n%s\nfill model: %s", gcfg.describe(), model)
+
+    last_id = None
+    seen_ts = 0
     backoff = cfg.poll_seconds
+    saturated = 0
+    last_summary = time.time()
 
     while not stop.is_set():
         try:
-            ohlcv = ex.fetch_ohlcv(cfg.symbol, tf, limit=5)
-            for c in ohlcv:
-                if c[0] <= seen_ts:
-                    continue
-                seen_ts = c[0]
-                for ev in sim.step(c[2], c[3], c[4]):
-                    log.info("PAPER %s cell=%d @ %.2f | equity=%.2f",
-                             ev["side"], ev["cell"], ev["price"], sim.equity(c[4]))
-            px = ohlcv[-1][4]
+            if cfg.fill_model == "trades":
+                limit = 1000
+                trades = ex.fetch_trades(cfg.symbol, limit=limit)
+                fresh = []
+                for t in trades:
+                    tid = t.get("id")
+                    if last_id is not None and tid is not None:
+                        try:
+                            if int(tid) <= int(last_id):
+                                continue
+                        except (TypeError, ValueError):
+                            if t.get("timestamp", 0) <= seen_ts:
+                                continue
+                    elif t.get("timestamp", 0) <= seen_ts:
+                        continue
+                    fresh.append(t)
+
+                if len(trades) >= limit and last_id is not None:
+                    # we asked for the maximum and got it -- the tape may have
+                    # outrun us between polls, so some volume went unseen and
+                    # fills will be UNDER-counted.
+                    saturated += 1
+                    if saturated in (1, 10, 100):
+                        log.warning("trade tape saturated (%d polls) -- consider "
+                                    "--poll-seconds below %d", saturated, cfg.poll_seconds)
+
+                for t in fresh:
+                    for ev in sim.on_trade(float(t["price"]), float(t["amount"])):
+                        log.info("PAPER %s cell=%d @ %.2f qty=%.8f | equity=%.2f",
+                                 ev["side"], ev["cell"], ev["price"], ev["qty"],
+                                 sim.equity(float(t["price"])))
+                        if ev["side"] == "sell":
+                            notifier.send(f"PAPER round trip #{sim.completed} "
+                                          f"cell {ev['cell']} @ {ev['price']:,.2f}")
+                if fresh:
+                    last_id = fresh[-1].get("id") or last_id
+                    seen_ts = fresh[-1].get("timestamp") or seen_ts
+                    px = float(fresh[-1]["price"])
+                else:
+                    px = float(ex.fetch_ticker(cfg.symbol)["last"])
+            else:
+                ohlcv = ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=5)
+                for c in ohlcv:
+                    if c[0] <= seen_ts:
+                        continue
+                    seen_ts = c[0]
+                    for ev in sim.step(c[2], c[3], c[4]):
+                        log.info("PAPER %s cell=%d @ %.2f | equity=%.2f",
+                                 ev["side"], ev["cell"], ev["price"], sim.equity(c[4]))
+                px = float(ohlcv[-1][4])
+
             if cfg.rebuild_on_drift and (px < gcfg.lower * (1 - cfg.escape_tolerance)
                                          or px > gcfg.upper * (1 + cfg.escape_tolerance)):
-                st = sim.stats(px)
-                notifier.send(f"⚠️ price {px:,.2f} escaped grid — re-centring.\n"
-                              f"realised so far: {st['realized_pnl']:,.2f}, "
-                              f"total PnL {st['total_pnl']:,.2f}")
+                notifier.send(f"PAPER price {px:,.2f} escaped the grid — re-centring.\n"
+                              + _paper_report(sim, px))
                 eq = sim.equity(px)
                 gcfg = make_grid_around(px, eq, cfg.range_pct, cfg.grids, cfg.fee)
-                sim = GridSim(gcfg, cash=eq)
+                sim = GridSim(gcfg, cash=eq, fill_through_pct=cfg.fill_through_pct,
+                              queue_factor=cfg.queue_factor)
+                last_id = None
                 log.info("re-centred around %.2f", px)
+
+            if time.time() - last_summary > 6 * 3600:
+                notifier.send(_paper_report(sim, px, "PAPER 6h update"))
+                last_summary = time.time()
+
             backoff = cfg.poll_seconds
-        except ccxt.NetworkError as e:
-            log.warning("network: %s (backoff %ds)", e, backoff)
+        except ccxt.RateLimitExceeded as e:
             backoff = min(backoff * 2, 300)
+            log.warning("rate limited: %s (backoff %ds)", e, backoff)
+        except ccxt.NetworkError as e:
+            backoff = min(backoff * 2, 300)
+            log.warning("network: %s (backoff %ds)", e, backoff)
         stop.wait(backoff)
 
-    px = ex.fetch_ticker(cfg.symbol)["last"]
-    notifier.send(f"PAPER stopped.\n{json.dumps(sim.stats(px), indent=2, default=float)}")
+    px = float(ex.fetch_ticker(cfg.symbol)["last"])
+    notifier.send("PAPER stopped.\n" + _paper_report(sim, px))
+    log.info("\n%s", _paper_report(sim, px))
 
 
 def run_live(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> None:
@@ -759,6 +852,17 @@ def parse_args() -> Config:
                    help="per side. 0.00075 if you pay fees in BNB")
     p.add_argument("--poll-seconds", type=int, default=d.poll_seconds)
     p.add_argument("--max-drawdown-pct", type=float, default=d.max_drawdown_pct)
+    p.add_argument("--fill-model", choices=["trades", "candles"], default=d.fill_model,
+                   help="paper mode fill realism. 'trades' consumes the public "
+                        "tape and requires real volume through a level")
+    p.add_argument("--queue-factor", type=float, default=d.queue_factor,
+                   help="trades model: multiples of our own order size that must "
+                        "trade at/through a level before we count a fill. "
+                        "1.0 = front of queue, 2.0 = one equal order ahead")
+    p.add_argument("--fill-through-pct", type=float, default=d.fill_through_pct,
+                   help="paper mode only: how far price must trade THROUGH a "
+                        "level before a fill counts. 0 = optimistic (touch); "
+                        "0.0005 = conservative proxy for queue position")
     p.add_argument("--state-file", default=d.state_file)
     p.add_argument("--seed-inventory", action="store_true",
                    help="market-buy base for cells above price so the grid can "
@@ -784,7 +888,9 @@ def parse_args() -> Config:
     cfg = Config(symbol=a.symbol, mode=a.mode, budget=a.budget, grids=a.grids,
                  range_pct=a.range_pct, fee=a.fee, poll_seconds=a.poll_seconds,
                  max_drawdown_pct=a.max_drawdown_pct, state_file=a.state_file,
-                 seed_inventory=a.seed_inventory, post_only=not a.no_post_only)
+                 seed_inventory=a.seed_inventory, post_only=not a.no_post_only,
+                 fill_through_pct=a.fill_through_pct,
+                 fill_model=a.fill_model, queue_factor=a.queue_factor)
     cfg._cancel_all = a.cancel_all      # type: ignore[attr-defined]
     return cfg
 
