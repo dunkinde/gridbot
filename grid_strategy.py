@@ -256,6 +256,45 @@ class GridSim:
                                "qty": float(held), "cell": i})
         return events
 
+    # ---- persistence -----------------------------------------------------
+    def to_dict(self) -> dict:
+        """Everything needed to resume this simulation exactly."""
+        return {
+            "cash": self.cash,
+            "holdings": list(self.holdings),
+            "cost_basis": list(self.cost_basis),
+            "pending_vol": list(self.pending_vol),
+            "armed": list(self.armed),
+            "buys": self.buys,
+            "sells": self.sells,
+            "completed": self.completed,
+            "fees_paid": self.fees_paid,
+            "realized_pnl": self.realized_pnl,
+            "trades_seen": self.trades_seen,
+            "volume_seen": self.volume_seen,
+            "queue_factor": self.queue_factor,
+            "fill_through_pct": self.fill_through_pct,
+        }
+
+    def load_dict(self, d: dict) -> None:
+        """Restore from to_dict(). The GridConfig must already match."""
+        n = self.cfg.grids
+        def fit(seq, default):
+            seq = list(seq or [])
+            return (seq + [default] * n)[:n]
+        self.cash = float(d.get("cash", self.cash))
+        self.holdings = [float(x) for x in fit(d.get("holdings"), 0.0)]
+        self.cost_basis = [float(x) for x in fit(d.get("cost_basis"), 0.0)]
+        self.pending_vol = [float(x) for x in fit(d.get("pending_vol"), 0.0)]
+        self.armed = [bool(x) for x in fit(d.get("armed"), False)]
+        self.buys = int(d.get("buys", 0))
+        self.sells = int(d.get("sells", 0))
+        self.completed = int(d.get("completed", 0))
+        self.fees_paid = float(d.get("fees_paid", 0.0))
+        self.realized_pnl = float(d.get("realized_pnl", 0.0))
+        self.trades_seen = int(d.get("trades_seen", 0))
+        self.volume_seen = float(d.get("volume_seen", 0.0))
+
     # ---- reporting -------------------------------------------------------
     def base_held(self) -> float:
         return sum(self.holdings)

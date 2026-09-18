@@ -662,6 +662,50 @@ class LiveGrid:
 # --------------------------------------------------------------------------
 # Runners
 # --------------------------------------------------------------------------
+PAPER_STATE_VERSION = 1
+
+
+def _paper_save(cfg: Config, gcfg, sim, last_id, started_at) -> None:
+    """Atomic snapshot so a restart resumes the measurement instead of resetting."""
+    payload = {
+        "version": PAPER_STATE_VERSION,
+        "symbol": cfg.symbol,
+        "grid": {"lower": gcfg.lower, "upper": gcfg.upper,
+                 "grids": gcfg.grids, "budget": gcfg.budget,
+                 "levels": list(gcfg.levels)},
+        "sim": sim.to_dict(),
+        "last_id": str(last_id) if last_id is not None else None,
+        "started_at": started_at,
+        "saved_at": time.time(),
+    }
+    tmp = cfg.state_file + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, cfg.state_file)
+    except OSError as e:
+        log.warning("could not save paper state: %s", e)
+
+
+def _paper_load(cfg: Config):
+    """Return (grid_dict, sim_dict, last_id, started_at) or None."""
+    if not os.path.exists(cfg.state_file):
+        return None
+    try:
+        with open(cfg.state_file) as fh:
+            st = json.load(fh)
+    except Exception as e:
+        log.warning("paper state unreadable (%s) — starting fresh", e)
+        return None
+    if st.get("version") != PAPER_STATE_VERSION or st.get("symbol") != cfg.symbol:
+        log.warning("paper state is for a different version/symbol — starting fresh")
+        return None
+    return (st.get("grid"), st.get("sim"), st.get("last_id"),
+            st.get("started_at", time.time()))
+
+
 def _drain_tape(ex, symbol, last_id, limit=1000, max_pages=25):
     """
     Yield pages of the public trade tape, walking FORWARD from `last_id` until
@@ -724,9 +768,28 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
               level by `fill_through_pct`. Crude, and flattering.
     """
     price = float(ex.fetch_ticker(cfg.symbol)["last"])
-    gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
-    sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
-                  queue_factor=cfg.queue_factor)
+    resumed = _paper_load(cfg)
+    started_at = time.time()
+    last_id = None
+
+    if resumed:
+        gdict, sdict, last_id, started_at = resumed
+        gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
+        # adopt the SAVED band, not a fresh one around today's price, or the
+        # measurement silently re-centres on every restart and the week's
+        # numbers become meaningless
+        gcfg.lower, gcfg.upper = gdict["lower"], gdict["upper"]
+        gcfg.levels = list(gdict["levels"])
+        sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
+                      queue_factor=cfg.queue_factor)
+        sim.load_dict(sdict or {})
+        age = (time.time() - (resumed[3] or time.time())) / 3600
+        log.info("resumed paper state: %d round trips, %.1f h of run so far",
+                 sim.completed, age)
+    else:
+        gcfg = make_grid_around(price, cfg.budget, cfg.range_pct, cfg.grids, cfg.fee)
+        sim = GridSim(gcfg, fill_through_pct=cfg.fill_through_pct,
+                      queue_factor=cfg.queue_factor)
 
     model = (f"trade tape, need {cfg.queue_factor:g}x own size through a level"
              if cfg.fill_model == "trades"
@@ -735,11 +798,12 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                   f"fill model: {model}")
     log.info("\n%s\nfill model: %s", gcfg.describe(), model)
 
-    last_id = None
     seen_ts = 0
     backoff = cfg.poll_seconds
     saturated = 0
     last_summary = time.time()
+    last_saved = 0.0
+    last_saved_fills = -1
 
     while not stop.is_set():
         try:
@@ -773,6 +837,11 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                                  "up by paging, no volume lost", saturated)
                 if px is None:
                     px = float(ex.fetch_ticker(cfg.symbol)["last"])
+                if sim.buys + sim.sells != last_saved_fills or \
+                        time.time() - last_saved > 60:
+                    _paper_save(cfg, gcfg, sim, last_id, started_at)
+                    last_saved_fills = sim.buys + sim.sells
+                    last_saved = time.time()
             else:
                 ohlcv = ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=5)
                 for c in ohlcv:
@@ -793,6 +862,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
                 sim = GridSim(gcfg, cash=eq, fill_through_pct=cfg.fill_through_pct,
                               queue_factor=cfg.queue_factor)
                 last_id = None
+                _paper_save(cfg, gcfg, sim, last_id, started_at)
                 log.info("re-centred around %.2f", px)
 
             if time.time() - last_summary > 6 * 3600:
@@ -809,6 +879,7 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
         stop.wait(backoff)
 
     px = float(ex.fetch_ticker(cfg.symbol)["last"])
+    _paper_save(cfg, gcfg, sim, last_id, started_at)
     notifier.send("PAPER stopped.\n" + _paper_report(sim, px))
     log.info("\n%s", _paper_report(sim, px))
 
