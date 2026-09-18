@@ -193,25 +193,62 @@ EOF
 cat > "$HOME/bin/bot-crashtest" <<'EOF'
 #!/bin/bash
 # Simulates a hard crash and verifies the ladder is NOT duplicated.
-echo "counting orders before..."
-before=$(bot-count) || { echo "count failed"; exit 1; }
-echo "  before: $before"
-echo "killing the bot with SIGKILL (no clean shutdown)..."
-sudo systemctl kill -s SIGKILL gridbot
+# Aborts loudly if the preconditions are not met -- a test that cannot fail
+# is not a test.
+set -u
+
+if ! systemctl cat gridbot.service >/dev/null 2>&1; then
+  echo "ABORT: gridbot.service does not exist."
+  echo "       The bot is not running under systemd, so there is nothing to crash."
+  echo "       Set up the service first, then re-run this."
+  exit 2
+fi
+if ! systemctl is-active --quiet gridbot; then
+  echo "ABORT: gridbot.service exists but is not running."
+  echo "       Start it with 'bot-start', let it place its ladder, then re-run."
+  exit 2
+fi
+
+pid_before=$(systemctl show gridbot -p MainPID --value)
+before=$(bot-count) || { echo "ABORT: could not count orders"; exit 2; }
+echo "before:  $before order(s), pid $pid_before"
+
+if [ "$before" -eq 0 ]; then
+  echo "ABORT: no open orders, so a duplicate ladder would be invisible."
+  echo "       Wait until the bot has placed its grid, then re-run."
+  exit 2
+fi
+
+echo "killing with SIGKILL (no clean shutdown)..."
+sudo systemctl kill -s SIGKILL gridbot || { echo "ABORT: kill failed"; exit 2; }
+
 echo "waiting 30s for systemd to restart it..."
 sleep 30
-echo "counting orders after..."
-after=$(bot-count) || { echo "count failed"; exit 1; }
-echo "  after:  $after"
+
+if ! systemctl is-active --quiet gridbot; then
+  echo "FAIL: the bot did not come back. Check 'bot-logs'."
+  exit 1
+fi
+pid_after=$(systemctl show gridbot -p MainPID --value)
+if [ "$pid_before" = "$pid_after" ]; then
+  echo "ABORT: pid is still $pid_after -- the process never actually died."
+  exit 2
+fi
+
+after=$(bot-count) || { echo "ABORT: could not count orders"; exit 2; }
+echo "after:   $after order(s), pid $pid_after"
 echo
+
 if [ "$before" = "$after" ]; then
-  echo "PASS - order count unchanged ($before), no duplicate ladder"
+  echo "PASS - order count unchanged ($before), pid changed $pid_before -> $pid_after"
+  echo "       The bot re-adopted its existing orders instead of laying a second ladder."
 else
-  echo "FAIL - count changed $before -> $after. Investigate before going live."
+  echo "FAIL - count changed $before -> $after. Do NOT go live until this is understood."
 fi
 echo
-journalctl -u gridbot -n 25 --no-pager | grep -iE "resumed|reconcil|orphan|vanish" || \
-  echo "(no reconcile lines in the last 25 log lines)"
+echo "--- reconciliation lines from the restart ---"
+journalctl -u gridbot -n 40 --no-pager | grep -iE "resumed|reconcil|orphan|vanish" \
+  || echo "(none found -- expected at least a 'resumed state' line)"
 EOF
 
 # ---- bot-update : pull new code from GitHub -------------------------------
