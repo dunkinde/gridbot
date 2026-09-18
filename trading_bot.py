@@ -662,6 +662,38 @@ class LiveGrid:
 # --------------------------------------------------------------------------
 # Runners
 # --------------------------------------------------------------------------
+def _drain_tape(ex, symbol, last_id, limit=1000, max_pages=25):
+    """
+    Yield pages of the public trade tape, walking FORWARD from `last_id` until
+    caught up. Polling the latest N trades loses volume whenever the tape moves
+    faster than the poll interval -- BTC/USDT does 250+ trades a second, so a
+    1000-trade window covers only a few seconds. Paging by trade id makes the
+    poll interval a latency knob rather than a correctness one.
+
+    Pages are yielded (not accumulated) to keep memory flat on a small box.
+    `max_pages` bounds one catch-up so a long outage cannot replay for ever.
+    """
+    pages = 0
+    while pages < max_pages:
+        params = {}
+        if last_id is not None:
+            try:
+                params["fromId"] = int(last_id) + 1
+            except (TypeError, ValueError):
+                params = {}
+        batch = ex.fetch_trades(symbol, limit=limit, params=params)
+        if not batch:
+            return
+        yield batch, (len(batch) >= limit)
+        nid = batch[-1].get("id")
+        if nid is None or str(nid) == str(last_id):
+            return
+        last_id = nid
+        pages += 1
+        if len(batch) < limit:
+            return
+
+
 def _paper_report(sim, px, label="PAPER") -> str:
     st = sim.stats(px)
     fee_ratio = (st["fees_paid"] / st["realized_pnl"]) if st["realized_pnl"] > 0 else float("inf")
@@ -712,44 +744,34 @@ def run_paper(ex, cfg: Config, notifier: Notifier, stop: threading.Event) -> Non
     while not stop.is_set():
         try:
             if cfg.fill_model == "trades":
-                limit = 1000
-                trades = ex.fetch_trades(cfg.symbol, limit=limit)
-                fresh = []
-                for t in trades:
-                    tid = t.get("id")
-                    if last_id is not None and tid is not None:
-                        try:
-                            if int(tid) <= int(last_id):
-                                continue
-                        except (TypeError, ValueError):
-                            if t.get("timestamp", 0) <= seen_ts:
-                                continue
-                    elif t.get("timestamp", 0) <= seen_ts:
-                        continue
-                    fresh.append(t)
-
-                if len(trades) >= limit and last_id is not None:
-                    # we asked for the maximum and got it -- the tape may have
-                    # outrun us between polls, so some volume went unseen and
-                    # fills will be UNDER-counted.
+                px = None
+                behind = False
+                for batch, full in _drain_tape(ex, cfg.symbol, last_id):
+                    behind = behind or full
+                    for t in batch:
+                        tid = t.get("id")
+                        if last_id is not None and tid is not None:
+                            try:
+                                if int(tid) <= int(last_id):
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+                        for ev in sim.on_trade(float(t["price"]), float(t["amount"])):
+                            log.info("PAPER %s cell=%d @ %.2f qty=%.8f | equity=%.2f",
+                                     ev["side"], ev["cell"], ev["price"], ev["qty"],
+                                     sim.equity(float(t["price"])))
+                            if ev["side"] == "sell":
+                                notifier.send(f"PAPER round trip #{sim.completed} "
+                                              f"cell {ev['cell']} @ {ev['price']:,.2f}")
+                    last_id = batch[-1].get("id") or last_id
+                    seen_ts = batch[-1].get("timestamp") or seen_ts
+                    px = float(batch[-1]["price"])
+                if behind:
                     saturated += 1
-                    if saturated in (1, 10, 100):
-                        log.warning("trade tape saturated (%d polls) -- consider "
-                                    "--poll-seconds below %d", saturated, cfg.poll_seconds)
-
-                for t in fresh:
-                    for ev in sim.on_trade(float(t["price"]), float(t["amount"])):
-                        log.info("PAPER %s cell=%d @ %.2f qty=%.8f | equity=%.2f",
-                                 ev["side"], ev["cell"], ev["price"], ev["qty"],
-                                 sim.equity(float(t["price"])))
-                        if ev["side"] == "sell":
-                            notifier.send(f"PAPER round trip #{sim.completed} "
-                                          f"cell {ev['cell']} @ {ev['price']:,.2f}")
-                if fresh:
-                    last_id = fresh[-1].get("id") or last_id
-                    seen_ts = fresh[-1].get("timestamp") or seen_ts
-                    px = float(fresh[-1]["price"])
-                else:
+                    if saturated in (1, 50, 500):
+                        log.info("tape ran ahead of the poll %d time(s) -- caught "
+                                 "up by paging, no volume lost", saturated)
+                if px is None:
                     px = float(ex.fetch_ticker(cfg.symbol)["last"])
             else:
                 ohlcv = ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=5)
